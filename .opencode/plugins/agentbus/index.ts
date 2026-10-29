@@ -37,21 +37,26 @@ const DEFAULT_AGENTS: Record<string, { role: string; workingDirectory: string; w
   }
 }
 
-// Static, immutable system prompt block for prefix caching stability
+// 100% Static & Immutable System Prompt for Maximum Prefix Cache Hitting
 const STATIC_HEAD_SYSTEM_PROMPT = `=== AGENTBUS HEAD COORDINATOR MODE ===
 You are the designated HEAD coordinator agent.
-You delegate implementation tasks to persistent sub-agents (frontend, backend, tester, dbmaster) using the 'agentbus' tool.
+You manage and delegate to persistent sub-agents using the single tool 'agentbus'.
 
 TOOL USAGE SCHEMA:
-Use the 'agentbus' tool with:
-- action: "invoke" (wait for completion) | "trigger" (background) | "poke" (status check) | "list"
-- agent: "frontend" | "backend" | "tester" | "dbmaster"
-- task: brief slug/id (e.g. "01-crm-schema")
-- message: exact task instructions wrapped in <agent id="main" task="...">[instructions]</agent>
+Use the 'agentbus' tool with one of these actions:
+- action: "send"   -> Shoot-and-forget task delegation (returns 'running'). When finished, the sub-agent auto-notifies you with its success block.
+                      Requires: agent, task, message.
+- action: "btw"    -> Ephemeral question (/btw). Asks the sub-agent a question without polluting the conversation transcript. Returns the answer immediately.
+                      Requires: agent, question.
+- action: "create" -> Creates a new named sub-agent with its own persistent session.
+                      Requires: agent, role. Optional: workingDirectory, writeScope.
+- action: "rename" -> Renames an existing sub-agent.
+                      Requires: agent, newName.
+- action: "delete" -> Deletes and removes a sub-agent session.
+                      Requires: agent.
+- action: "list"   -> Lists active sub-agents and their persistent sessions.
 
-Sub-agents work in isolated sessions and return:
-<agent id="[agent_id]" task="[task]">[agentFinalOutput]</agent>
-Do not perform sub-agent implementation tasks directly.`
+Do not implement sub-agent tasks directly; delegate via 'agentbus'.`
 
 async function loadSkillsIndex(skillNames: string[]): Promise<string> {
   const home = process.env.HOME || "/home/asayman"
@@ -114,19 +119,18 @@ export default {
       return Object.values(registry).some((a) => a.sessionID === sessionID)
     }
 
-    async function getOrCreateAgentSession(agentId: string): Promise<AgentRegistryEntry> {
+    async function initSubAgentSession(
+      agentId: string,
+      role?: string,
+      workingDir?: string,
+      writeScope?: string[]
+    ): Promise<AgentRegistryEntry> {
       const registry = await getAgents()
-      if (registry[agentId]) {
-        try {
-          const s = await ctx.session.get({ sessionID: registry[agentId].sessionID })
-          if (s) return registry[agentId]
-        } catch {}
-      }
 
       const template = DEFAULT_AGENTS[agentId] || {
-        role: `Specialized agent for ${agentId}`,
-        workingDirectory: agentId,
-        writeScope: [`${agentId}/**`],
+        role: role || `Specialized engineer for ${agentId}`,
+        workingDirectory: workingDir || agentId,
+        writeScope: writeScope || [`${agentId}/**`],
         skills: []
       }
 
@@ -181,14 +185,74 @@ You receive tasks in the format:
       return entry
     }
 
+    async function getOrCreateAgentSession(agentId: string): Promise<AgentRegistryEntry> {
+      const registry = await getAgents()
+      if (registry[agentId]) {
+        try {
+          const s = await ctx.session.get({ sessionID: registry[agentId].sessionID })
+          if (s) return registry[agentId]
+        } catch {}
+      }
+
+      return await initSubAgentSession(agentId)
+    }
+
+    // Monitor background sub-agents and trigger the main agent on completion
+    const activeTasks = new Map<string, { mainSessionID: string; agentId: string; task: string }>()
+
+    if (ctx.event?.subscribe) {
+      const abortCtrl = new AbortController()
+      ;(async () => {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: abortCtrl.signal })) {
+            if (event.type === "session.idle" || event.type === "session.status") {
+              const sid = (event as any).sessionID || (event as any).data?.sessionID || (event as any).data?.id
+              if (sid && activeTasks.has(sid)) {
+                const info = activeTasks.get(sid)!
+                activeTasks.delete(sid)
+
+                // Sub-agent has finished its turn; extract final assistant summary
+                try {
+                  const msgs = await ctx.session.context({ sessionID: sid })
+                  let summary = "Task completed."
+                  if (Array.isArray(msgs)) {
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                      const m = msgs[i]
+                      if (m.role === "assistant" || m.author === "assistant" || m.agent === info.agentId) {
+                        const body = m.text || m.content || JSON.stringify(m)
+                        summary = typeof body === "string" ? body : JSON.stringify(body)
+                        break
+                      }
+                    }
+                  }
+
+                  // Auto-trigger main agent with success block
+                  const notification = `<agent id="${info.agentId}" task="${info.task}">
+${summary}
+</agent>`
+
+                  await ctx.session.prompt({
+                    sessionID: info.mainSessionID,
+                    text: notification,
+                    delivery: "queue"
+                  })
+                } catch (e) {
+                  console.error("Error auto-notifying main agent:", e)
+                }
+              }
+            }
+          }
+        } catch {}
+      })()
+    }
+
     // Command to initialize HEAD coordinator
     if (ctx.command?.transform) {
       await ctx.command.transform((cmdEditor: any) => {
         cmdEditor.add({
           name: "agentbus-init",
-          description: "Initialize and claim the current session as the HEAD coordinator agent",
+          description: "Initialize and lock the current session as the HEAD coordinator agent",
           execute: async ({ sessionID }: any) => {
-            // Rule 1: Sub-agents can NEVER run init
             if (await isSubAgentSession(sessionID)) {
               await ctx.session.synthetic({
                 sessionID,
@@ -197,7 +261,6 @@ You receive tasks in the format:
               return
             }
 
-            // Rule 2: If init was already run in this session or another session, prevent re-running
             const currentHead = await getHeadSessionID()
             if (currentHead === sessionID) {
               await ctx.session.synthetic({
@@ -215,7 +278,6 @@ You receive tasks in the format:
               return
             }
 
-            // Lock this session as the one and only HEAD
             await setHeadSessionID(sessionID)
 
             try {
@@ -234,16 +296,13 @@ You receive tasks in the format:
       })
     }
 
-    // Context hook: Sits at the very end of event.system, right before the 1st user message.
-    // Kept 100% static and immutable across turns to guarantee prompt cache hits.
+    // Prefix Caching Hook: Injects static prompt at the very tail of event.system, right before 1st user message
     if (ctx.session?.hook) {
       try {
         await ctx.session.hook("context", async (event: any) => {
           const currentHead = await getHeadSessionID()
           if (currentHead && event.sessionID === currentHead) {
             event.system = event.system || []
-
-            // Deduplication: ensure it only sits once at the very end of the system block
             const exists = event.system.some(
               (p: any) => p.text && p.text.includes("=== AGENTBUS HEAD COORDINATOR MODE ===")
             )
@@ -259,38 +318,55 @@ You receive tasks in the format:
       } catch {}
     }
 
-    // Unified single tool call: "agentbus"
+    // Single unified 'agentbus' tool
     await ctx.tool.transform((editor: any) => {
       editor.add({
         name: "agentbus",
-        description: "Coordinate, invoke, trigger, or check persistent sub-agents (frontend, backend, tester, dbmaster). Only executable from the designated HEAD session.",
+        description: "Coordinate, delegate, query, create, rename, or delete persistent sub-agents. Restricted to HEAD session.",
         input: {
           type: "object",
           properties: {
             action: {
               type: "string",
-              enum: ["invoke", "trigger", "poke", "list"],
-              description: "Action to perform: 'invoke' (synchronous wait), 'trigger' (asynchronous fire-and-forget), 'poke' (status check nudge), or 'list' (view all sub-agents)"
+              enum: ["send", "btw", "create", "rename", "delete", "list"],
+              description: "Action to perform: 'send' (shoot-and-forget task), 'btw' (ephemeral question), 'create' (new agent), 'rename' (rename agent), 'delete' (delete agent), 'list' (view all agents)"
             },
             agent: {
               type: "string",
-              description: "Target sub-agent identifier: 'frontend', 'backend', 'tester', 'dbmaster', or custom sub-agent"
+              description: "Target sub-agent identifier (e.g. 'frontend', 'backend', 'tester', 'dbmaster', or custom)"
             },
             task: {
               type: "string",
-              description: "Task title, brief identifier, or slug (e.g., '01-crm-schema', 'fix-nav')"
+              description: "Task title, brief identifier, or slug (required for action='send')"
             },
             message: {
               type: "string",
-              description: "Task brief, instructions, and acceptance criteria to relay to the sub-agent"
+              description: "Task instructions to relay to the sub-agent (required for action='send')"
+            },
+            question: {
+              type: "string",
+              description: "Ephemeral question for the sub-agent (required for action='btw')"
+            },
+            role: {
+              type: "string",
+              description: "Role description for new sub-agent (used with action='create')"
+            },
+            workingDirectory: {
+              type: "string",
+              description: "Working directory for new sub-agent (used with action='create')"
+            },
+            writeScope: {
+              type: "array",
+              items: { type: "string" },
+              description: "Allowed write globs (used with action='create', e.g. ['mobile/**'])"
+            },
+            newName: {
+              type: "string",
+              description: "New name for the sub-agent (used with action='rename')"
             },
             taskFilePath: {
               type: "string",
-              description: "Optional task file path to mirror the brief on disk (e.g., 'backend/AGENT/TASK.md' or 'sub-agent/01-task.md')"
-            },
-            note: {
-              type: "string",
-              description: "Optional note or reminder when using action='poke'"
+              description: "Optional file path to mirror the task brief on disk (e.g. 'backend/AGENT/TASK.md')"
             }
           },
           required: ["action"],
@@ -300,15 +376,15 @@ You receive tasks in the format:
           const sessionID = context?.sessionID
           const currentHead = await getHeadSessionID()
 
-          // Strict boundary check: only HEAD can execute agentbus
           if (currentHead && sessionID && sessionID !== currentHead) {
             return {
               content: `Error: The 'agentbus' tool is restricted to the designated HEAD coordinator session (${currentHead}). This session (${sessionID}) is not authorized.`
             }
           }
 
-          const { action, agent, task, message, taskFilePath, note } = input
+          const { action, agent, task, message, question, role, workingDirectory, writeScope, newName, taskFilePath } = input
 
+          // 1. LIST
           if (action === "list") {
             const registry = await getAgents()
             const list = Object.values(registry).map((a) => ({
@@ -324,37 +400,83 @@ You receive tasks in the format:
             }
           }
 
-          if (!agent) {
+          // 2. CREATE NEW AGENT
+          if (action === "create") {
+            if (!agent) return { content: "Error: 'agent' identifier is required to create an agent." }
+            const registry = await getAgents()
+            if (registry[agent]) {
+              return { content: `Error: Sub-agent '${agent}' already exists with session '${registry[agent].sessionID}'.` }
+            }
+
+            const created = await initSubAgentSession(agent, role, workingDirectory, writeScope)
             return {
-              content: "Error: 'agent' argument is required for actions 'invoke', 'trigger', and 'poke'."
+              content: `Successfully created persistent sub-agent [${agent}] (Session: ${created.sessionID}, WorkingDir: ${created.workingDirectory}).`
             }
           }
 
-          const target = await getOrCreateAgentSession(agent)
+          // 3. RENAME AGENT
+          if (action === "rename") {
+            if (!agent || !newName) return { content: "Error: Both 'agent' and 'newName' are required to rename an agent." }
+            const registry = await getAgents()
+            if (!registry[agent]) return { content: `Error: Sub-agent '${agent}' not found.` }
 
-          if (action === "poke") {
-            await ctx.session.prompt({
-              sessionID: target.sessionID,
-              text: note || "Please report your current task status.",
-              delivery: "steer"
-            })
+            const entry = registry[agent]
+            delete registry[agent]
+            entry.id = newName
+            registry[newName] = entry
+            await saveAgents(registry)
+
+            try {
+              await ctx.session.update({
+                sessionID: entry.sessionID,
+                title: `AgentBus: ${newName}`
+              })
+            } catch {}
+
             return {
-              content: `Poked sub-agent [${agent}].`
+              content: `Successfully renamed sub-agent [${agent}] to [${newName}].`
             }
           }
 
-          if (action === "trigger") {
-            if (!task || !message) {
-              return {
-                content: "Error: Both 'task' and 'message' are required for action='trigger'."
-              }
+          // 4. DELETE AGENT
+          if (action === "delete") {
+            if (!agent) return { content: "Error: 'agent' identifier is required to delete an agent." }
+            const registry = await getAgents()
+            if (!registry[agent]) return { content: `Error: Sub-agent '${agent}' not found.` }
+
+            const sid = registry[agent].sessionID
+            delete registry[agent]
+            await saveAgents(registry)
+
+            try {
+              await ctx.session.remove({ sessionID: sid })
+            } catch {}
+
+            return {
+              content: `Successfully deleted sub-agent [${agent}] and removed session [${sid}].`
             }
+          }
+
+          // 5. SHOOT-AND-FORGET TASK (SEND)
+          if (action === "send") {
+            if (!agent || !task || !message) {
+              return { content: "Error: 'agent', 'task', and 'message' are all required for action='send'." }
+            }
+
+            const target = await getOrCreateAgentSession(agent)
 
             if (taskFilePath) {
               const absTaskPath = path.resolve(rootDir, taskFilePath)
               await fs.mkdir(path.dirname(absTaskPath), { recursive: true })
               await fs.writeFile(absTaskPath, message, "utf-8")
             }
+
+            // Track active task for auto-notification when the sub-agent becomes idle
+            activeTasks.set(target.sessionID, {
+              mainSessionID: sessionID || currentHead || "",
+              agentId: agent,
+              task: task
+            })
 
             const promptPayload = `<agent id="main" task="${task}">
 ${message}
@@ -367,57 +489,45 @@ ${message}
             })
 
             return {
-              content: `Triggered background sub-agent [${agent}] for task "${task}".`
+              content: `[status: running] Task "${task}" dispatched to sub-agent [${agent}]. When the sub-agent finishes, you will be automatically triggered with its completion block.`
             }
           }
 
-          if (action === "invoke") {
-            if (!task || !message) {
-              return {
-                content: "Error: Both 'task' and 'message' are required for action='invoke'."
-              }
+          // 6. EPHEMERAL QUESTION (/BTW)
+          if (action === "btw") {
+            if (!agent || !question) {
+              return { content: "Error: 'agent' and 'question' are required for action='btw'." }
             }
 
-            if (taskFilePath) {
-              const absTaskPath = path.resolve(rootDir, taskFilePath)
-              await fs.mkdir(path.dirname(absTaskPath), { recursive: true })
-              await fs.writeFile(absTaskPath, message, "utf-8")
-            }
+            const target = await getOrCreateAgentSession(agent)
 
-            const promptPayload = `<agent id="main" task="${task}">
-${message}
-</agent>`
-
-            await ctx.session.prompt({
-              sessionID: target.sessionID,
-              text: promptPayload
-            })
-
-            await ctx.session.wait({ sessionID: target.sessionID })
-
-            const messages = await ctx.session.context({ sessionID: target.sessionID })
-            let lastAssistantText = "Task completed."
-
-            if (Array.isArray(messages)) {
-              for (let i = messages.length - 1; i >= 0; i--) {
-                const m = messages[i]
-                if (m.agent === agent || m.role === "assistant" || m.author === "assistant") {
-                  const body = m.text || m.content || JSON.stringify(m)
-                  lastAssistantText = typeof body === "string" ? body : JSON.stringify(body)
-                  break
-                }
+            // Transient generation without adding to conversation history
+            let answer = ""
+            try {
+              const gen = await ctx.session.generate({
+                sessionID: target.sessionID,
+                prompt: `[Ephemeral Side-Question /btw]: ${question}`
+              })
+              answer = gen?.text || "No response received."
+            } catch {
+              // Fallback to experimental generate if session generate is not supported
+              try {
+                const gen = await ctx.experimental?.generate?.text?.({
+                  prompt: `You are sub-agent [${agent.toUpperCase()}]. Context: ${target.role}. Question: ${question}`
+                })
+                answer = gen?.text || "No response received."
+              } catch (e: any) {
+                answer = `Failed to generate ephemeral response: ${e.message}`
               }
             }
 
             return {
-              content: `<agent id="${agent}" task="${task}">
-${lastAssistantText}
-</agent>`
+              content: `[/btw answer from ${agent}]:\n${answer}`
             }
           }
 
           return {
-            content: `Unknown action '${action}'. Supported: invoke, trigger, poke, list.`
+            content: `Unknown action '${action}'. Supported: send, btw, create, rename, delete, list.`
           }
         }
       })
