@@ -138,6 +138,22 @@ export default {
         title: `AgentBus: ${agentId}`
       })
 
+      // Inherit the exact model and provider currently used by the HEAD coordinator session
+      const headId = await getHeadSessionID()
+      if (headId) {
+        try {
+          const headSession = await ctx.session.get({ sessionID: headId })
+          if (headSession?.model) {
+            await ctx.session.switchModel({
+              sessionID: session.id,
+              model: headSession.model
+            })
+          }
+        } catch (e) {
+          console.error("Failed to inherit model from head session:", e)
+        }
+      }
+
       const skillsText = await loadSkillsIndex(template.skills)
       const scopeText = template.writeScope.map((s) => `- ${s}`).join("\n")
 
