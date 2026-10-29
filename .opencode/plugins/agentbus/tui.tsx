@@ -36,50 +36,7 @@ export default Plugin.define({
       return null
     }
 
-    // 1. Right beside the input prompt / prompt footer
-    const unregisterPromptSlot = context.ui?.slot?.({
-      prepend: "prompt.footer",
-      render: () => {
-        const currentRoute = context.ui?.router?.current?.()
-        const sid = currentRoute?.sessionID
-        if (!sid) return null
-        const badge = getBadge(sid)
-        if (!badge) return null
-        return (
-          <box paddingRight={1}>
-            {badge}
-          </box>
-        )
-      }
-    })
-
-    // 2. Prompt footer status indicator
-    const unregisterStatusSlot = context.ui?.slot?.({
-      append: "prompt.footer.status",
-      render: () => {
-        const currentRoute = context.ui?.router?.current?.()
-        const sid = currentRoute?.sessionID
-        if (!sid) return null
-        return getBadge(sid)
-      }
-    })
-
-    // 3. Sidebar content under session item
-    const unregisterSidebarSlot = context.ui?.slot?.({
-      append: "sidebar.content",
-      render: ({ sessionID }: { sessionID?: string }) => {
-        if (!sessionID) return null
-        const badge = getBadge(sessionID)
-        if (!badge) return null
-        return (
-          <box paddingLeft={1}>
-            {badge}
-          </box>
-        )
-      }
-    })
-
-    // 4. Fallback in session composer top
+    // Only 1 slot: Directly above the prompt composer box (just below the session chat title/area)
     const unregisterComposerSlot = context.ui?.slot?.({
       prepend: "session.composer.top",
       render: () => {
@@ -97,9 +54,6 @@ export default Plugin.define({
     })
 
     return () => {
-      unregisterPromptSlot?.()
-      unregisterStatusSlot?.()
-      unregisterSidebarSlot?.()
       unregisterComposerSlot?.()
     }
   }
