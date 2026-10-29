@@ -56,7 +56,12 @@ Use the 'agentbus' tool with one of these actions:
                       Requires: agent.
 - action: "list"   -> Lists active sub-agents and their persistent sessions.
 
-Do not implement sub-agent tasks directly; delegate via 'agentbus'.`
+DELEGATION RULES:
+1. When asked to deploy, delegate, or assign work to a sub-agent:
+   - If the sub-agent does not exist, first 'create' it, then immediately 'send' the task to it.
+   - If the sub-agent already exists, directly 'send' the task to it.
+   - Never just 'create' an agent and stop if there is a task to perform.
+2. Do not implement sub-agent tasks directly in the main session; delegate via 'agentbus'.`
 
 async function loadSkillsIndex(skillNames: string[]): Promise<string> {
   const home = process.env.HOME || "/home/asayman"
@@ -184,6 +189,35 @@ export default {
       return Object.values(registry).some((a) => a.sessionID === sessionID)
     }
 
+    async function buildSubAgentInstructions(entry: AgentRegistryEntry): Promise<string> {
+      const skillsText = await loadSkillsIndex(entry.skills || [])
+      const scopeText = (entry.writeScope || []).map((s) => `- ${s}`).join("\n")
+
+      return `You are persistent sub-agent: [${entry.id.toUpperCase()}].
+Role: ${entry.role}
+Assigned Working Directory: ${entry.workingDirectory} (Absolute path: ${path.resolve(rootDir, entry.workingDirectory)})
+
+=== STRICT WORKING DIRECTORY & FILE CREATION RULE ===
+All your files, edits, scripts, and commands MUST be executed inside your Assigned Working Directory:
+\`${path.resolve(rootDir, entry.workingDirectory)}\`
+Never create or modify files directly in the root workspace unless explicitly authorized. Before creating any file, ensure its directory path starts with your assigned working directory.
+
+=== WRITE ACCESS CONSTRAINT (STRICT) ===
+You are authorized to write and edit ONLY inside your allowed scope:
+${scopeText}
+Do NOT edit or write files outside this scope under any circumstances. If you need modifications outside your scope, report back to the main agent.
+
+${skillsText}
+
+=== TASK PROTOCOL ===
+You receive tasks in the format:
+<agent id="main" task="...">[task_content]</agent>
+
+1. Follow the task brief and work strictly within your scope.
+2. Complete all work and verification.
+3. Finish with your clear summary.`
+    }
+
     async function initSubAgentSession(
       agentId: string,
       role?: string,
@@ -219,44 +253,6 @@ export default {
         }
       }
 
-      const skillsText = await loadSkillsIndex(template.skills)
-      const scopeText = template.writeScope.map((s) => `- ${s}`).join("\n")
-
-      const subAgentInstructions = `You are persistent sub-agent: [${agentId.toUpperCase()}].
-Role: ${template.role}
-Assigned Working Directory: ${template.workingDirectory} (Absolute path: ${path.resolve(rootDir, template.workingDirectory)})
-
-=== STRICT WORKING DIRECTORY & FILE CREATION RULE ===
-All your files, edits, scripts, and commands MUST be executed inside your Assigned Working Directory:
-\`${path.resolve(rootDir, template.workingDirectory)}\`
-Never create or modify files directly in the root workspace unless explicitly authorized. Before creating any file, ensure its directory path starts with your assigned working directory.
-
-=== WRITE ACCESS CONSTRAINT (STRICT) ===
-You are authorized to write and edit ONLY inside your allowed scope:
-${scopeText}
-Do NOT edit or write files outside this scope under any circumstances. If you need modifications outside your scope, report back to the main agent.
-
-${skillsText}
-
-=== TASK PROTOCOL ===
-You receive tasks in the format:
-<agent id="main" task="...">[task_content]</agent>
-
-1. Follow the task brief and work strictly within your scope.
-2. Complete all work and verification.
-3. Finish with your clear summary.
-`
-
-      try {
-        if (ctx.session.instructions?.entry?.put) {
-          await ctx.session.instructions.entry.put({
-            sessionID: session.id,
-            key: "agentbus_config",
-            value: subAgentInstructions
-          })
-        }
-      } catch {}
-
       const entry: AgentRegistryEntry = {
         id: agentId,
         sessionID: session.id,
@@ -268,6 +264,15 @@ You receive tasks in the format:
 
       registry[agentId] = entry
       await saveAgents(registry)
+      await setAgentStatus(agentId, { status: "idle" })
+
+      try {
+        await ctx.session.synthetic({
+          sessionID: session.id,
+          text: `[AgentBus] Sub-agent [${agentId.toUpperCase()}] initialized.\nRole: ${template.role}\nWorking Directory: ${path.resolve(rootDir, template.workingDirectory)}`
+        })
+      } catch {}
+
       return entry
     }
 
@@ -442,7 +447,7 @@ ${result.summary}
       })
     }
 
-    // Prefix Caching Hook: Injects static prompt at the very tail of event.system, right before 1st user message
+    // Instruction Injection Hook: Injects static prompt for HEAD and dynamic instructions for sub-agents
     if (ctx.session?.hook) {
       try {
         await ctx.session.hook("context", async (event: any) => {
@@ -457,6 +462,23 @@ ${result.summary}
               event.system.push({
                 type: "text",
                 text: STATIC_HEAD_SYSTEM_PROMPT
+              })
+            }
+            return
+          }
+
+          const registry = await getAgents()
+          const subAgent = Object.values(registry).find((a) => a.sessionID === event.sessionID)
+          if (subAgent) {
+            event.system = event.system || []
+            const exists = event.system.some(
+              (p: any) => p.text && p.text.includes(`persistent sub-agent: [${subAgent.id.toUpperCase()}]`)
+            )
+            if (!exists) {
+              const instr = await buildSubAgentInstructions(subAgent)
+              event.system.push({
+                type: "text",
+                text: instr
               })
             }
           }
@@ -478,6 +500,23 @@ ${result.summary}
               event.system.push({
                 type: "text",
                 text: STATIC_HEAD_SYSTEM_PROMPT
+              })
+            }
+            return
+          }
+
+          const registry = await getAgents()
+          const subAgent = Object.values(registry).find((a) => a.sessionID === event.sessionID)
+          if (subAgent) {
+            event.system = event.system || []
+            const exists = event.system.some(
+              (p: any) => p.text && p.text.includes(`persistent sub-agent: [${subAgent.id.toUpperCase()}]`)
+            )
+            if (!exists) {
+              const instr = await buildSubAgentInstructions(subAgent)
+              event.system.push({
+                type: "text",
+                text: instr
               })
             }
           }
@@ -614,6 +653,13 @@ ${result.summary}
             const sid = registry[agent].sessionID
             delete registry[agent]
             await saveAgents(registry)
+
+            activeTasks.delete(sid)
+            try {
+              const statuses = await getAgentStatuses()
+              delete statuses[agent]
+              await ctx.storage.set("agent_statuses", statuses)
+            } catch {}
 
             try {
               await ctx.session.remove({ sessionID: sid })
