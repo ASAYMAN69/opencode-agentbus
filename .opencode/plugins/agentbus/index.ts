@@ -37,6 +37,22 @@ const DEFAULT_AGENTS: Record<string, { role: string; workingDirectory: string; w
   }
 }
 
+// Static, immutable system prompt block for prefix caching stability
+const STATIC_HEAD_SYSTEM_PROMPT = `=== AGENTBUS HEAD COORDINATOR MODE ===
+You are the designated HEAD coordinator agent.
+You delegate implementation tasks to persistent sub-agents (frontend, backend, tester, dbmaster) using the 'agentbus' tool.
+
+TOOL USAGE SCHEMA:
+Use the 'agentbus' tool with:
+- action: "invoke" (wait for completion) | "trigger" (background) | "poke" (status check) | "list"
+- agent: "frontend" | "backend" | "tester" | "dbmaster"
+- task: brief slug/id (e.g. "01-crm-schema")
+- message: exact task instructions wrapped in <agent id="main" task="...">[instructions]</agent>
+
+Sub-agents work in isolated sessions and return:
+<agent id="[agent_id]" task="[task]">[agentFinalOutput]</agent>
+Do not perform sub-agent implementation tasks directly.`
+
 async function loadSkillsIndex(skillNames: string[]): Promise<string> {
   const home = process.env.HOME || "/home/asayman"
   const skillsBase = path.join(home, ".agents", "skills")
@@ -121,7 +137,7 @@ export default {
       const skillsText = await loadSkillsIndex(template.skills)
       const scopeText = template.writeScope.map((s) => `- ${s}`).join("\n")
 
-      const instructions = `You are persistent sub-agent: [${agentId.toUpperCase()}].
+      const subAgentInstructions = `You are persistent sub-agent: [${agentId.toUpperCase()}].
 Role: ${template.role}
 Working Directory: ${template.workingDirectory}
 
@@ -146,12 +162,7 @@ You receive tasks in the format:
           await ctx.session.instructions.entry.put({
             sessionID: session.id,
             key: "agentbus_config",
-            value: instructions
-          })
-        } else {
-          await ctx.session.prompt({
-            sessionID: session.id,
-            text: instructions
+            value: subAgentInstructions
           })
         }
       } catch {}
@@ -170,75 +181,79 @@ You receive tasks in the format:
       return entry
     }
 
-    // Command to elect the current session as the HEAD coordinator agent
+    // Command to initialize HEAD coordinator
     if (ctx.command?.transform) {
       await ctx.command.transform((cmdEditor: any) => {
         cmdEditor.add({
           name: "agentbus-init",
           description: "Initialize and claim the current session as the HEAD coordinator agent",
           execute: async ({ sessionID }: any) => {
-            // Guard: Sub-agents are never allowed to run or claim HEAD
+            // Rule 1: Sub-agents can NEVER run init
             if (await isSubAgentSession(sessionID)) {
               await ctx.session.synthetic({
                 sessionID,
-                text: "Error: Sub-agent sessions are forbidden from executing agentbus-init."
+                text: "Error: Sub-agent sessions are permanently forbidden from executing agentbus-init."
               })
               return
             }
 
+            // Rule 2: If init was already run in this session or another session, prevent re-running
             const currentHead = await getHeadSessionID()
-            if (currentHead && currentHead !== sessionID) {
+            if (currentHead === sessionID) {
               await ctx.session.synthetic({
                 sessionID,
-                text: `AgentBus: A HEAD agent session is already designated (\`${currentHead}\`). Re-assigning HEAD to this session (\`${sessionID}\`).`
+                text: "AgentBus: This session is already initialized as the HEAD coordinator. Re-running is prohibited."
               })
+              return
             }
 
+            if (currentHead) {
+              await ctx.session.synthetic({
+                sessionID,
+                text: `AgentBus: Session '${currentHead}' is already designated as the HEAD coordinator. Only one HEAD coordinator is allowed.`
+              })
+              return
+            }
+
+            // Lock this session as the one and only HEAD
             await setHeadSessionID(sessionID)
 
-            // Inject coordinator instructions to the bottom of the system prompt / instructions
-            const headInstructions = `
-=== AGENTBUS HEAD COORDINATOR MODE ===
-You are the designated HEAD agent for AgentBus.
-You coordinate and delegate work to persistent sub-agents (frontend, backend, tester, dbmaster) using the single tool call: \`agentbus\`.
-
-When delegating:
-Call \`agentbus\` with action="invoke" (or "trigger") to relay tasks in the format:
-<agent id="main" task="...">[task instructions]</agent>
-
-Sub-agents work within their dedicated sessions and reply with:
-<agent id="[agent_id]" task="...">[agentFinalOutput]</agent>
-`
             try {
-              if (ctx.session.instructions?.entry?.put) {
-                await ctx.session.instructions.entry.put({
-                  sessionID,
-                  key: "agentbus_head_instructions",
-                  value: headInstructions
-                })
-              }
+              const current = await ctx.session.get({ sessionID })
+              const title = current?.title || "MAIN AGENT"
+              const newTitle = title.startsWith("[MAIN]") ? title : `[MAIN] ${title}`
+              await ctx.session.update({ sessionID, title: newTitle })
             } catch {}
 
             await ctx.session.synthetic({
               sessionID,
-              text: "AgentBus initialized. This session is now the designated HEAD coordinator agent. The `agentbus` tool is active."
+              text: "AgentBus initialized. This session is now the locked HEAD coordinator. The static prompt has been appended to your system instructions for prompt cache efficiency."
             })
           }
         })
       })
     }
 
-    // Hook session context to inject system instructions at the very bottom
+    // Context hook: Sits at the very end of event.system, right before the 1st user message.
+    // Kept 100% static and immutable across turns to guarantee prompt cache hits.
     if (ctx.session?.hook) {
       try {
         await ctx.session.hook("context", async (event: any) => {
           const currentHead = await getHeadSessionID()
           if (currentHead && event.sessionID === currentHead) {
             event.system = event.system || []
-            event.system.push({
-              type: "text",
-              text: `\n=== AGENTBUS HEAD COORDINATOR ACTIVE ===\nYou have the \`agentbus\` tool available to invoke, trigger, or poke persistent sub-agents (frontend, backend, tester, dbmaster).`
-            })
+
+            // Deduplication: ensure it only sits once at the very end of the system block
+            const exists = event.system.some(
+              (p: any) => p.text && p.text.includes("=== AGENTBUS HEAD COORDINATOR MODE ===")
+            )
+
+            if (!exists) {
+              event.system.push({
+                type: "text",
+                text: STATIC_HEAD_SYSTEM_PROMPT
+              })
+            }
           }
         })
       } catch {}
@@ -259,7 +274,7 @@ Sub-agents work within their dedicated sessions and reply with:
             },
             agent: {
               type: "string",
-              description: "Target sub-agent identifier: 'frontend', 'backend', 'tester', 'dbmaster', or any custom sub-agent name"
+              description: "Target sub-agent identifier: 'frontend', 'backend', 'tester', 'dbmaster', or custom sub-agent"
             },
             task: {
               type: "string",
@@ -285,7 +300,7 @@ Sub-agents work within their dedicated sessions and reply with:
           const sessionID = context?.sessionID
           const currentHead = await getHeadSessionID()
 
-          // Enforcement: If HEAD session is set, reject any call coming from other sessions (e.g. sub-agents)
+          // Strict boundary check: only HEAD can execute agentbus
           if (currentHead && sessionID && sessionID !== currentHead) {
             return {
               content: `Error: The 'agentbus' tool is restricted to the designated HEAD coordinator session (${currentHead}). This session (${sessionID}) is not authorized.`
