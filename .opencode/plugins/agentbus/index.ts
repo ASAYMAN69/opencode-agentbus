@@ -175,7 +175,12 @@ export default {
 
       const subAgentInstructions = `You are persistent sub-agent: [${agentId.toUpperCase()}].
 Role: ${template.role}
-Working Directory: ${template.workingDirectory}
+Assigned Working Directory: ${template.workingDirectory} (Absolute path: ${path.resolve(rootDir, template.workingDirectory)})
+
+=== STRICT WORKING DIRECTORY & FILE CREATION RULE ===
+All your files, edits, scripts, and commands MUST be executed inside your Assigned Working Directory:
+\`${path.resolve(rootDir, template.workingDirectory)}\`
+Never create or modify files directly in the root workspace unless explicitly authorized. Before creating any file, ensure its directory path starts with your assigned working directory.
 
 === WRITE ACCESS CONSTRAINT (STRICT) ===
 You are authorized to write and edit ONLY inside your allowed scope:
@@ -539,12 +544,20 @@ ${message}
             // Record status as running
             await setAgentStatus(agent, { task, status: "running", startedAt: Date.now() })
 
-            // Prompt sub-agent session (shoot-and-forget)
-            await ctx.session.prompt({
-              sessionID: target.sessionID,
-              text: promptPayload,
-              delivery: "steer"
-            })
+            // Prompt sub-agent session (shoot-and-forget) cleanly without crashing on mid-turn steering
+            try {
+              await ctx.session.prompt({
+                sessionID: target.sessionID,
+                text: promptPayload
+              })
+            } catch (err: any) {
+              // Fallback to queue delivery if session is busy
+              await ctx.session.prompt({
+                sessionID: target.sessionID,
+                text: promptPayload,
+                delivery: "queue"
+              })
+            }
 
             // Spawn background monitoring promise that awaits sub-agent completion and auto-triggers main
             (async () => {
