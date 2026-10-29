@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-30
+
+### Added
+- **Interruption Detection & Notification**:
+  - Automatically detects when a sub-agent is interrupted mid-task (due to user cancel, provider interrupt, tool failure, or session error).
+  - Emits a synthetic alert directly to the user: `Sub-agent '<agentId>' was interrupted during task '<task>'`.
+  - Notifies the main coordinator with `<agent id="..." task="..." status="interrupted">` instead of falsely reporting task completion.
+  - Displays `✗ interrupted: <task>` in the right sidebar process view.
+- **`/agentbus-init <extra text>` User Message Turn**:
+  - Trailing text after `/agentbus-init` (e.g. `/agentbus-init delegate 3 sub agents immediately`) is automatically forwarded as a standard user chat turn.
+
 ## [0.1.0] - 2026-10-29
 
 ### Added

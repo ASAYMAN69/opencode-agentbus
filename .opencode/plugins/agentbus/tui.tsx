@@ -98,6 +98,15 @@ export default Plugin.define({
             )
           }
 
+          if (statusInfo?.status === "interrupted") {
+            return (
+              <box paddingLeft={1} flexDirection="row">
+                <text fg="red" bold>✗ interrupted: </text>
+                <text fg="#808080">{statusInfo.task}</text>
+              </box>
+            )
+          }
+
           return (
             <box paddingLeft={1}>
               <text fg="#606060">idle</text>

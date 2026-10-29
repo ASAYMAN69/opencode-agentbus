@@ -106,6 +106,55 @@ export default {
       } catch {}
     }
 
+    async function checkSessionInterrupted(sessionID: string, agentId: string): Promise<{ interrupted: boolean; reason: string; summary: string }> {
+      try {
+        const msgs = await ctx.session.context({ sessionID })
+        let lastAssistantMsg: any = null
+        if (Array.isArray(msgs)) {
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i]
+            if (m.role === "assistant" || m.author === "assistant" || m.agent === agentId || m.type === "assistant") {
+              lastAssistantMsg = m
+              break
+            }
+          }
+        }
+
+        if (!lastAssistantMsg) {
+          return { interrupted: true, reason: "No output produced before interruption", summary: "" }
+        }
+
+        if (lastAssistantMsg.finish === "error" || lastAssistantMsg.error) {
+          const reason = lastAssistantMsg.error?.message || (typeof lastAssistantMsg.error === "string" ? lastAssistantMsg.error : "Turn interrupted with error")
+          return { interrupted: true, reason, summary: "" }
+        }
+
+        if (Array.isArray(lastAssistantMsg.content)) {
+          for (const item of lastAssistantMsg.content) {
+            if (item.type === "tool") {
+              const errMsg = item.state?.error?.message || item.error?.message || ""
+              if (errMsg.toLowerCase().includes("interrupted") || errMsg.toLowerCase().includes("aborted")) {
+                return { interrupted: true, reason: errMsg, summary: "" }
+              }
+            }
+          }
+        }
+
+        try {
+          const sess = await ctx.session.get({ sessionID })
+          if (sess?.status?.type === "error") {
+            return { interrupted: true, reason: sess.status.message || "Sub-agent error", summary: "" }
+          }
+        } catch {}
+
+        const body = lastAssistantMsg.text || lastAssistantMsg.content || ""
+        const summary = typeof body === "string" ? body : JSON.stringify(body)
+        return { interrupted: false, reason: "", summary: summary || "Task completed." }
+      } catch (err: any) {
+        return { interrupted: true, reason: err?.message || String(err), summary: "" }
+      }
+    }
+
     async function getAgentStatuses(): Promise<Record<string, any>> {
       try {
         return (await ctx.storage.get("agent_statuses")) || {}
@@ -234,8 +283,60 @@ You receive tasks in the format:
       return await initSubAgentSession(agentId)
     }
 
-    // Monitor background sub-agents and trigger the main agent on completion
+    // Monitor background sub-agents and trigger the main agent on completion or report interruption
     const activeTasks = new Map<string, { mainSessionID: string; agentId: string; task: string }>()
+
+    async function handleSubAgentFinished(sid: string, info: { mainSessionID: string; agentId: string; task: string }) {
+      if (!activeTasks.has(sid)) return
+      activeTasks.delete(sid)
+
+      try {
+        const result = await checkSessionInterrupted(sid, info.agentId)
+        if (result.interrupted) {
+          await setAgentStatus(info.agentId, { task: info.task, status: "interrupted", finishedAt: Date.now() })
+
+          // Tell the user directly that the sub-agent was interrupted
+          await ctx.session.synthetic({
+            sessionID: info.mainSessionID,
+            text: `Sub-agent '${info.agentId}' was interrupted during task '${info.task}'${result.reason ? ` (${result.reason})` : ""}.`
+          })
+
+          // Notify main agent of interruption rather than blindly claiming completion
+          if (info.mainSessionID) {
+            const notification = `<agent id="${info.agentId}" task="${info.task}" status="interrupted">
+Task was interrupted before completion. Reason: ${result.reason || "Execution stopped."}
+</agent>`
+
+            await ctx.session.prompt({
+              sessionID: info.mainSessionID,
+              text: notification,
+              delivery: "queue"
+            })
+          }
+        } else {
+          await setAgentStatus(info.agentId, { task: info.task, status: "completed", finishedAt: Date.now() })
+
+          if (info.mainSessionID) {
+            const notification = `<agent id="${info.agentId}" task="${info.task}">
+${result.summary}
+</agent>`
+
+            await ctx.session.prompt({
+              sessionID: info.mainSessionID,
+              text: notification,
+              delivery: "queue"
+            })
+          }
+        }
+      } catch (err) {
+        console.error("Error handling sub-agent finish:", err)
+        await setAgentStatus(info.agentId, { task: info.task, status: "interrupted", finishedAt: Date.now() })
+        await ctx.session.synthetic({
+          sessionID: info.mainSessionID,
+          text: `Sub-agent '${info.agentId}' was interrupted or failed during task '${info.task}'.`
+        })
+      }
+    }
 
     if (ctx.event?.subscribe) {
       const abortCtrl = new AbortController()
@@ -246,36 +347,7 @@ You receive tasks in the format:
               const sid = (event as any).sessionID || (event as any).data?.sessionID || (event as any).data?.id
               if (sid && activeTasks.has(sid)) {
                 const info = activeTasks.get(sid)!
-                activeTasks.delete(sid)
-
-                // Sub-agent has finished its turn; extract final assistant summary
-                try {
-                  const msgs = await ctx.session.context({ sessionID: sid })
-                  let summary = "Task completed."
-                  if (Array.isArray(msgs)) {
-                    for (let i = msgs.length - 1; i >= 0; i--) {
-                      const m = msgs[i]
-                      if (m.role === "assistant" || m.author === "assistant" || m.agent === info.agentId) {
-                        const body = m.text || m.content || JSON.stringify(m)
-                        summary = typeof body === "string" ? body : JSON.stringify(body)
-                        break
-                      }
-                    }
-                  }
-
-                  // Auto-trigger main agent with success block
-                  const notification = `<agent id="${info.agentId}" task="${info.task}">
-${summary}
-</agent>`
-
-                  await ctx.session.prompt({
-                    sessionID: info.mainSessionID,
-                    text: notification,
-                    delivery: "queue"
-                  })
-                } catch (e) {
-                  console.error("Error auto-notifying main agent:", e)
-                }
+                await handleSubAgentFinished(sid, info)
               }
             }
           }
@@ -289,7 +361,10 @@ ${summary}
         cmdEditor.add({
           name: "agentbus-init",
           description: "Initialize and lock the current session as the HEAD coordinator agent",
-          execute: async ({ sessionID }: any) => {
+          execute: async (input: any) => {
+            const sessionID = input?.sessionID
+            if (!sessionID) return
+
             if (await isSubAgentSession(sessionID)) {
               await ctx.session.synthetic({
                 sessionID,
@@ -298,12 +373,31 @@ ${summary}
               return
             }
 
+            let userText = ""
+            if (typeof input?.args === "string" && input.args.trim()) {
+              userText = input.args.trim()
+            } else if (Array.isArray(input?.args) && input.args.length > 0) {
+              userText = input.args.join(" ").trim()
+            } else if (typeof input?.prompt?.text === "string") {
+              userText = input.prompt.text.replace(/^\/agentbus-init\s*/i, "").trim()
+            } else if (typeof input?.text === "string") {
+              userText = input.text.replace(/^\/agentbus-init\s*/i, "").trim()
+            }
+
             const currentHead = await getHeadSessionID()
             if (currentHead === sessionID) {
-              await ctx.session.synthetic({
-                sessionID,
-                text: "AgentBus: This session is already initialized as the HEAD coordinator. Re-running is prohibited."
-              })
+              if (userText) {
+                await ctx.session.prompt({
+                  sessionID,
+                  text: userText,
+                  delivery: input?.delivery || "steer"
+                })
+              } else {
+                await ctx.session.synthetic({
+                  sessionID,
+                  text: "AgentBus: This session is already initialized as the HEAD coordinator."
+                })
+              }
               return
             }
 
@@ -331,10 +425,18 @@ ${summary}
               await ctx.session.update({ sessionID, title: newTitle })
             } catch {}
 
-            await ctx.session.synthetic({
-              sessionID,
-              text: "AgentBus initialized. This session is now the HEAD coordinator agent."
-            })
+            if (userText) {
+              await ctx.session.prompt({
+                sessionID,
+                text: userText,
+                delivery: input?.delivery || "steer"
+              })
+            } else {
+              await ctx.session.synthetic({
+                sessionID,
+                text: "AgentBus initialized. This session is now the HEAD coordinator agent."
+              })
+            }
           }
         })
       })
@@ -559,43 +661,18 @@ ${message}
               })
             }
 
-            // Spawn background monitoring promise that awaits sub-agent completion and auto-triggers main
+            // Register active task
+            const taskInfo = { mainSessionID: mainID, agentId: agent, task }
+            activeTasks.set(target.sessionID, taskInfo)
+
+            // Spawn background monitoring fallback that awaits sub-agent completion and auto-triggers main
             (async () => {
               try {
                 // Wait for sub-agent session to finish execution
                 await ctx.session.wait({ sessionID: target.sessionID })
-
-                // Extract the sub-agent's final output
-                const msgs = await ctx.session.context({ sessionID: target.sessionID })
-                let summary = "Task completed."
-                if (Array.isArray(msgs)) {
-                  for (let i = msgs.length - 1; i >= 0; i--) {
-                    const m = msgs[i]
-                    if (m.role === "assistant" || m.author === "assistant" || m.agent === agent) {
-                      const body = m.text || m.content || JSON.stringify(m)
-                      summary = typeof body === "string" ? body : JSON.stringify(body)
-                      break
-                    }
-                  }
-                }
-
-                // Update status to idle
-                await setAgentStatus(agent, { task, status: "completed", finishedAt: Date.now() })
-
-                // Auto-trigger the main coordinator session with the success block
-                if (mainID) {
-                  const notification = `<agent id="${agent}" task="${task}">
-${summary}
-</agent>`
-
-                  await ctx.session.prompt({
-                    sessionID: mainID,
-                    text: notification
-                  })
-                }
+                await handleSubAgentFinished(target.sessionID, taskInfo)
               } catch (err) {
-                console.error(`Error waiting for sub-agent [${agent}]:`, err)
-                await setAgentStatus(agent, { task, status: "error" })
+                await handleSubAgentFinished(target.sessionID, taskInfo)
               }
             })()
 
