@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-30
+
+### Fixed
+- **ASI Parsing Bug on Dispatch**:
+  - Replaced IIFE with `void monitorTask()` to prevent JavaScript Automatic Semicolon Insertion from parsing `activeTasks.set(...)(async () => ...)` as an invalid function invocation.
+- **Sub-Agent Blank Session & Instruction Injection**:
+  - Automatically injects dynamic sub-agent role, working directory, write boundaries, and skills into `event.system` via `hook("context")` and `hook("compaction")`.
+  - Dispatches an initial synthetic banner when sub-agents are provisioned to prevent empty/dead sessions in the UI.
+- **Cleanup on Delete**:
+  - Purges `activeTasks` and `agent_statuses` when an agent is deleted.
+
+### Added
+- **AI Agent Handoff Guide**:
+  - Added comprehensive `HANDOFF.md` detailing system architecture, plugin lifecycle, file locations, mechanics, and operational rules for incoming AI agents and developers.
+
+## [0.1.2] - 2026-10-30
+
+### Fixed
+- Dynamic subagent instruction injection via context/compaction hook.
+- Added session banner and coordinator delegation rules.
+
 ## [0.1.1] - 2026-10-30
 
 ### Added

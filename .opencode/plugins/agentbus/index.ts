@@ -712,7 +712,7 @@ ${message}
             activeTasks.set(target.sessionID, taskInfo)
 
             // Spawn background monitoring fallback that awaits sub-agent completion and auto-triggers main
-            (async () => {
+            const monitorTask = async () => {
               try {
                 // Wait for sub-agent session to finish execution
                 await ctx.session.wait({ sessionID: target.sessionID })
@@ -720,7 +720,8 @@ ${message}
               } catch (err) {
                 await handleSubAgentFinished(target.sessionID, taskInfo)
               }
-            })()
+            }
+            void monitorTask()
 
             return {
               content: `[status: running] Task "${task}" dispatched to sub-agent [${agent}]. When the sub-agent finishes, you will be automatically triggered with its completion block.`
