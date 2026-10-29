@@ -98,6 +98,22 @@ export default {
       await ctx.storage.set("head_session_id", sessionID)
     }
 
+        async function setAgentStatus(agentId: string, info: any): Promise<void> {
+      try {
+        const statuses: any = (await ctx.storage.get("agent_statuses")) || {}
+        statuses[agentId] = info
+        await ctx.storage.set("agent_statuses", statuses)
+      } catch {}
+    }
+
+    async function getAgentStatuses(): Promise<Record<string, any>> {
+      try {
+        return (await ctx.storage.get("agent_statuses")) || {}
+      } catch {
+        return {}
+      }
+    }
+
     async function getAgents(): Promise<Record<string, AgentRegistryEntry>> {
       try {
         const saved = await ctx.storage.get("agent_registry")
@@ -515,22 +531,60 @@ ${summary}
               await fs.writeFile(absTaskPath, message, "utf-8")
             }
 
-            // Track active task for auto-notification when the sub-agent becomes idle
-            activeTasks.set(target.sessionID, {
-              mainSessionID: sessionID || currentHead || "",
-              agentId: agent,
-              task: task
-            })
-
+            const mainID = sessionID || currentHead || ""
             const promptPayload = `<agent id="main" task="${task}">
 ${message}
 </agent>`
 
+            // Record status as running
+            await setAgentStatus(agent, { task, status: "running", startedAt: Date.now() })
+
+            // Prompt sub-agent session (shoot-and-forget)
             await ctx.session.prompt({
               sessionID: target.sessionID,
               text: promptPayload,
               delivery: "steer"
             })
+
+            // Spawn background monitoring promise that awaits sub-agent completion and auto-triggers main
+            (async () => {
+              try {
+                // Wait for sub-agent session to finish execution
+                await ctx.session.wait({ sessionID: target.sessionID })
+
+                // Extract the sub-agent's final output
+                const msgs = await ctx.session.context({ sessionID: target.sessionID })
+                let summary = "Task completed."
+                if (Array.isArray(msgs)) {
+                  for (let i = msgs.length - 1; i >= 0; i--) {
+                    const m = msgs[i]
+                    if (m.role === "assistant" || m.author === "assistant" || m.agent === agent) {
+                      const body = m.text || m.content || JSON.stringify(m)
+                      summary = typeof body === "string" ? body : JSON.stringify(body)
+                      break
+                    }
+                  }
+                }
+
+                // Update status to idle
+                await setAgentStatus(agent, { task, status: "completed", finishedAt: Date.now() })
+
+                // Auto-trigger the main coordinator session with the success block
+                if (mainID) {
+                  const notification = `<agent id="${agent}" task="${task}">
+${summary}
+</agent>`
+
+                  await ctx.session.prompt({
+                    sessionID: mainID,
+                    text: notification
+                  })
+                }
+              } catch (err) {
+                console.error(`Error waiting for sub-agent [${agent}]:`, err)
+                await setAgentStatus(agent, { task, status: "error" })
+              }
+            })()
 
             return {
               content: `[status: running] Task "${task}" dispatched to sub-agent [${agent}]. When the sub-agent finishes, you will be automatically triggered with its completion block.`
