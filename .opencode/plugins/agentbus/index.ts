@@ -56,12 +56,17 @@ Use the 'agentbus' tool with one of these actions:
                       Requires: agent.
 - action: "list"   -> Lists active sub-agents and their persistent sessions.
 
-DELEGATION RULES:
-1. When asked to deploy, delegate, or assign work to a sub-agent:
-   - If the sub-agent does not exist, first 'create' it, then immediately 'send' the task to it.
-   - If the sub-agent already exists, directly 'send' the task to it.
-   - Never just 'create' an agent and stop if there is a task to perform.
-2. Do not implement sub-agent tasks directly in the main session; delegate via 'agentbus'.`
+DELEGATION RULES (file-based workflow):
+Workspace folders: AGENTS/CONTEXT/ (global context), AGENTS/TASKS/ (task files), AGENTS/COMPLETIONS/ (summaries).
+
+1. Before delegating, scope the task and gather global context into AGENTS/CONTEXT/ if missing.
+2. Write the task to AGENTS/TASKS/<agent>-<slug>.md (self-contained: goal, scope, constraints, acceptance criteria, and the exact completion file name AGENTS/COMPLETIONS/<agent>-<slug>.md).
+3. Deploy:
+   - New sub-agent: 'create' (relevant name + workingDirectory; empty = main cwd) then 'send'.
+   - Existing sub-agent: just 'send'.
+   - Never 'create' and stop if there is a task.
+4. In the 'send' message: refer to the task file path (absolute). Tell the sub-agent to read AGENTS/CONTEXT/* ONLY if it is a new agent or context changed; otherwise skip context and read only the task file. Include the completion file name so the sub-agent knows where to write its summary.
+5. Do not implement sub-agent tasks directly in the main session; delegate via 'agentbus'.`
 
 async function loadSkillsIndex(skillNames: string[]): Promise<string> {
   const home = process.env.HOME || "/home/asayman"
@@ -108,6 +113,14 @@ export default {
         const statuses: any = (await ctx.storage.get("agent_statuses")) || {}
         statuses[agentId] = info
         await ctx.storage.set("agent_statuses", statuses)
+      } catch {}
+      // Mirror to a shared file so the TUI plugin (separate storage namespace) can read it
+      try {
+        const statuses: any = (await ctx.storage.get("agent_statuses")) || {}
+        const fs = await import("node:fs/promises")
+        const path = await import("node:path")
+        const statusFile = path.join("/home/asayman/.config/opencode/plugins/agentbus", "status.json")
+        await fs.writeFile(statusFile, JSON.stringify(statuses), "utf-8")
       } catch {}
     }
 
@@ -214,8 +227,10 @@ You receive tasks in the format:
 <agent id="main" task="...">[task_content]</agent>
 
 1. Follow the task brief and work strictly within your scope.
-2. Complete all work and verification.
-3. Finish with your clear summary.`
+2. Read AGENTS/CONTEXT/* ONLY if the main agent explicitly says to (new agent or context changed).
+3. Complete all work and verification.
+4. Write a summary to the completion file path given by the main agent (AGENTS/COMPLETIONS/<agent>-<slug>.md).
+5. Finish with your clear summary.`
     }
 
     async function initSubAgentSession(
@@ -236,6 +251,16 @@ You receive tasks in the format:
       const session = await ctx.session.create({
         title: `AgentBus: ${agentId}`
       })
+
+      // Move the session into its assigned working directory so tool calls land there
+      try {
+        const fs = await import("node:fs/promises")
+        const pathMod = await import("node:path")
+        const wd = template.workingDirectory || agentId
+        const abs = pathMod.resolve(rootDir, wd)
+        await fs.mkdir(abs, { recursive: true })
+        await ctx.session.move({ sessionID: session.id, directory: abs })
+      } catch {}
 
       // Inherit the exact model and provider currently used by the HEAD coordinator session
       const headId = await getHeadSessionID()
@@ -573,6 +598,10 @@ ${result.summary}
             taskFilePath: {
               type: "string",
               description: "Optional file path to mirror the task brief on disk (e.g. 'backend/AGENT/TASK.md')"
+            },
+            workingDirectory: {
+              type: "string",
+              description: "Optional override of the sub-agent's working directory for this task (defaults to the agent's registered working directory / main cwd)"
             }
           },
           required: ["action"],
@@ -677,6 +706,23 @@ ${result.summary}
             }
 
             const target = await getOrCreateAgentSession(agent)
+
+            // Optional per-task working directory override
+            if (workingDirectory) {
+              const registry = await getAgents()
+              if (registry[agent]) {
+                registry[agent].workingDirectory = workingDirectory
+                await saveAgents(registry)
+              }
+              // Actually move the session's working directory so tool calls land in the right folder
+              try {
+                const fs = await import("node:fs/promises")
+                const pathMod = await import("node:path")
+                const abs = pathMod.resolve(rootDir, workingDirectory)
+                await fs.mkdir(abs, { recursive: true })
+                await ctx.session.move({ sessionID: target.sessionID, directory: abs })
+              } catch {}
+            }
 
             if (taskFilePath) {
               const absTaskPath = path.resolve(rootDir, taskFilePath)

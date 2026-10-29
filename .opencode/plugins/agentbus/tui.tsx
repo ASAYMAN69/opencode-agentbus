@@ -1,8 +1,23 @@
 import { Plugin } from "@opencode/plugin/tui"
+import * as fs from "node:fs"
+import { createSignal, onCleanup } from "solid-js"
 
 export default Plugin.define({
   id: "agentbus.tui",
   setup(context: any) {
+    const [statuses, setStatuses] = createSignal<any>({})
+    const readStatuses = () => {
+      try {
+        const raw = fs.readFileSync("/home/asayman/.config/opencode/plugins/agentbus/status.json", "utf-8")
+        setStatuses(JSON.parse(raw) || {})
+      } catch {
+        setStatuses({})
+      }
+    }
+    readStatuses()
+    const interval = setInterval(readStatuses, 1000)
+    onCleanup(() => clearInterval(interval))
+
     function getBadge(sid: string) {
       if (!sid) return null
       const session = context.data?.session?.get?.(sid)
@@ -60,9 +75,60 @@ export default Plugin.define({
         if (!sessionID) return null
         const session = context.data?.session?.get?.(sessionID)
         const title = session?.title || ""
+        const lower = title.toLowerCase()
+
+        // Main agent: show all sub-agent statuses in the sidebar
+        const isMain = lower.startsWith("[main]") || lower.includes("main agent") || lower.includes("head")
+        if (isMain) {
+          const allStatuses = statuses()
+          const keys = Object.keys(allStatuses)
+          if (keys.length === 0) {
+            return (
+              <box paddingLeft={1}>
+                <text fg="#606060">no sub-agents</text>
+              </box>
+            )
+          }
+          return (
+            <box paddingLeft={1} flexDirection="column">
+              {keys.map((agentKey) => {
+                const info = allStatuses[agentKey]
+                if (info?.status === "running") {
+                  return (
+                    <box flexDirection="row">
+                      <text fg="yellow" bold>● running: </text>
+                      <text fg="#a0a0a0">{agentKey} — {info.task}</text>
+                    </box>
+                  )
+                }
+                if (info?.status === "completed") {
+                  return (
+                    <box flexDirection="row">
+                      <text fg="green" bold>✓ done: </text>
+                      <text fg="#808080">{agentKey} — {info.task}</text>
+                    </box>
+                  )
+                }
+                if (info?.status === "interrupted") {
+                  return (
+                    <box flexDirection="row">
+                      <text fg="red" bold>✗ interrupted: </text>
+                      <text fg="#808080">{agentKey} — {info.task}</text>
+                    </box>
+                  )
+                }
+                return (
+                  <box>
+                    <text fg="#606060">{agentKey}: idle</text>
+                  </box>
+                )
+              })}
+            </box>
+          )
+        }
 
         // Check if this sidebar item is a sub-agent
-        if (title.startsWith("AgentBus:") || title.toLowerCase().includes("frontend") || title.toLowerCase().includes("backend") || title.toLowerCase().includes("tester") || title.toLowerCase().includes("dbmaster")) {
+        if (title.startsWith("AgentBus:") || lower.includes("frontend") || lower.includes("backend") || lower.includes("tester") || lower.includes("dbmaster")) {
           let agentKey = ""
           if (title.startsWith("AgentBus:")) {
             agentKey = title.replace("AgentBus:", "").trim().toLowerCase()
@@ -76,7 +142,8 @@ export default Plugin.define({
 
           let statusInfo: any = null
           try {
-            const statuses = context.storage?.get?.("agent_statuses") || {}
+            const raw = fs.readFileSync("/home/asayman/.config/opencode/plugins/agentbus/status.json", "utf-8")
+            const statuses = JSON.parse(raw) || {}
             statusInfo = statuses[agentKey]
           } catch {}
 
