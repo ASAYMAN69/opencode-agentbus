@@ -270,12 +270,19 @@ ${summary}
               return
             }
 
-            if (currentHead) {
+            // If a previous HEAD session was set, verify if it still exists or allow re-claiming
+            if (currentHead && currentHead !== sessionID) {
+              let previousExists = false
+              try {
+                const prev = await ctx.session.get({ sessionID: currentHead })
+                if (prev) previousExists = true
+              } catch {}
+
+              // Reassign HEAD to this session
               await ctx.session.synthetic({
                 sessionID,
-                text: `AgentBus: Session '${currentHead}' is already designated as the HEAD coordinator. Only one HEAD coordinator is allowed.`
+                text: `AgentBus: Reassigning HEAD coordinator role from previous session '${currentHead}' to this session.`
               })
-              return
             }
 
             await setHeadSessionID(sessionID)
