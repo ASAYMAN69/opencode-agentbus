@@ -3,108 +3,104 @@ import { Plugin } from "@opencode/plugin/tui"
 export default Plugin.define({
   id: "agentbus.tui",
   setup(context: any) {
-    function getSessionRole(sid: string): { type: "main" | "sub" | "none"; label?: string } {
-      if (!sid) return { type: "none" }
+    function getBadge(sid: string) {
+      if (!sid) return null
       const session = context.data?.session?.get?.(sid)
       const title = session?.title || ""
 
+      let isMain = false
       try {
         const storedHead = context.storage?.get?.("head_session_id")
-        if (storedHead === sid) return { type: "main", label: "MAIN" }
+        if (storedHead === sid) isMain = true
       } catch {}
 
       const lower = title.toLowerCase()
-      if (lower.includes("head") || lower.includes("main agent") || lower.startsWith("main")) {
-        return { type: "main", label: "MAIN" }
+      if (lower.startsWith("[main]") || lower.includes("main agent") || lower.includes("head")) {
+        isMain = true
+      }
+
+      if (isMain) {
+        return <text bg="red" fg="#d0d0d0" bold> MAIN </text>
       }
 
       if (title.startsWith("AgentBus:")) {
         const name = title.replace("AgentBus:", "").trim().toUpperCase()
-        return { type: "sub", label: name }
+        return <text bg="yellow" fg="black" bold> {name} </text>
       }
 
-      if (lower.includes("frontend")) return { type: "sub", label: "FRONTEND" }
-      if (lower.includes("backend")) return { type: "sub", label: "BACKEND" }
-      if (lower.includes("tester")) return { type: "sub", label: "TESTER" }
-      if (lower.includes("dbmaster")) return { type: "sub", label: "DBMASTER" }
+      if (lower.includes("frontend")) return <text bg="yellow" fg="black" bold> FRONTEND </text>
+      if (lower.includes("backend")) return <text bg="yellow" fg="black" bold> BACKEND </text>
+      if (lower.includes("tester")) return <text bg="yellow" fg="black" bold> TESTER </text>
+      if (lower.includes("dbmaster")) return <text bg="yellow" fg="black" bold> DBMASTER </text>
 
-      return { type: "none" }
+      return null
     }
 
-    const unregisterComposerSlot = context.ui?.slot?.({
-      prepend: "session.composer.top",
-      render: ({ sessionID }: { sessionID?: string }) => {
-        const sid = sessionID || context.ui?.router?.current?.()?.sessionID
+    // 1. Right beside the input prompt / prompt footer
+    const unregisterPromptSlot = context.ui?.slot?.({
+      prepend: "prompt.footer",
+      render: () => {
+        const currentRoute = context.ui?.router?.current?.()
+        const sid = currentRoute?.sessionID
         if (!sid) return null
-
-        const role = getSessionRole(sid)
-        if (role.type === "main") {
-          return (
-            <box paddingLeft={1} paddingRight={1} paddingTop={0} paddingBottom={0} marginBottom={1}>
-              <text bg="red" fg="#d0d0d0" bold> MAIN </text>
-            </box>
-          )
-        }
-
-        if (role.type === "sub") {
-          return (
-            <box paddingLeft={1} paddingRight={1} paddingTop={0} paddingBottom={0} marginBottom={1}>
-              <text bg="yellow" fg="black" bold> {role.label} </text>
-            </box>
-          )
-        }
-
-        return null
+        const badge = getBadge(sid)
+        if (!badge) return null
+        return (
+          <box paddingRight={1}>
+            {badge}
+          </box>
+        )
       }
     })
 
+    // 2. Prompt footer status indicator
+    const unregisterStatusSlot = context.ui?.slot?.({
+      append: "prompt.footer.status",
+      render: () => {
+        const currentRoute = context.ui?.router?.current?.()
+        const sid = currentRoute?.sessionID
+        if (!sid) return null
+        return getBadge(sid)
+      }
+    })
+
+    // 3. Sidebar content under session item
     const unregisterSidebarSlot = context.ui?.slot?.({
       append: "sidebar.content",
       render: ({ sessionID }: { sessionID?: string }) => {
         if (!sessionID) return null
-        const role = getSessionRole(sessionID)
-
-        if (role.type === "main") {
-          return (
-            <box paddingLeft={1}>
-              <text bg="red" fg="#d0d0d0" bold> MAIN </text>
-            </box>
-          )
-        }
-
-        if (role.type === "sub") {
-          return (
-            <box paddingLeft={1}>
-              <text bg="yellow" fg="black" bold> {role.label} </text>
-            </box>
-          )
-        }
-
-        return null
+        const badge = getBadge(sessionID)
+        if (!badge) return null
+        return (
+          <box paddingLeft={1}>
+            {badge}
+          </box>
+        )
       }
     })
 
-    const unregisterFooterSlot = context.ui?.slot?.({
-      append: "prompt.footer.status",
-      render: ({ sessionID }: { sessionID?: string }) => {
-        const sid = sessionID || context.ui?.router?.current?.()?.sessionID
+    // 4. Fallback in session composer top
+    const unregisterComposerSlot = context.ui?.slot?.({
+      prepend: "session.composer.top",
+      render: () => {
+        const currentRoute = context.ui?.router?.current?.()
+        const sid = currentRoute?.sessionID
         if (!sid) return null
-        const role = getSessionRole(sid)
-
-        if (role.type === "main") {
-          return <text bg="red" fg="#d0d0d0" bold> MAIN </text>
-        }
-        if (role.type === "sub") {
-          return <text bg="yellow" fg="black" bold> {role.label} </text>
-        }
-        return null
+        const badge = getBadge(sid)
+        if (!badge) return null
+        return (
+          <box paddingBottom={1}>
+            {badge}
+          </box>
+        )
       }
     })
 
     return () => {
-      unregisterComposerSlot?.()
+      unregisterPromptSlot?.()
+      unregisterStatusSlot?.()
       unregisterSidebarSlot?.()
-      unregisterFooterSlot?.()
+      unregisterComposerSlot?.()
     }
   }
 })

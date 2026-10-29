@@ -318,6 +318,27 @@ ${summary}
       } catch {}
     }
 
+    // Compaction Hook: Guarantees AgentBus instructions survive context compaction
+    if (ctx.session?.hook) {
+      try {
+        await ctx.session.hook("compaction", async (event: any) => {
+          const currentHead = await getHeadSessionID()
+          if (currentHead && event.sessionID === currentHead) {
+            event.system = event.system || []
+            const exists = event.system.some(
+              (p: any) => p.text && p.text.includes("=== AGENTBUS HEAD COORDINATOR MODE ===")
+            )
+            if (!exists) {
+              event.system.push({
+                type: "text",
+                text: STATIC_HEAD_SYSTEM_PROMPT
+              })
+            }
+          }
+        })
+      } catch {}
+    }
+
     // Single unified 'agentbus' tool
     await ctx.tool.transform((editor: any) => {
       editor.add({
