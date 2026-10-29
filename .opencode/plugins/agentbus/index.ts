@@ -296,7 +296,7 @@ ${summary}
 
             await ctx.session.synthetic({
               sessionID,
-              text: "AgentBus initialized. This session is now the locked HEAD coordinator. The static prompt has been appended to your system instructions for prompt cache efficiency."
+              text: "AgentBus initialized. This session is now the HEAD coordinator agent."
             })
           }
         })
