@@ -1,36 +1,35 @@
-# AgentBus Prompt & Workflow Plan (pending approval)
+# AgentBus: Monorepo/Multi-Repo Delegation Plan (pending approval)
 
-## Goal
-Refine the HEAD/sub-agent prompting so delegation uses a file-based, auditable workflow
-mirroring the proven zyrun `AGENT.md` + `AGENTS/` protocol, with unified directories.
+## Repo-type detection (main agent, before delegating)
+- If project has >1 `.git` OR top-level looks like frontend/backend/admin → MULTI-REPO.
+- If project has 1 `.git` and base contains src/lib/etc → MONOREPO.
+- If ambiguous → ask the user.
 
-## Proposed unified layout (new)
-```
-AGENTS/
-  CONTEXT/        # global project context docs (architecture, quirks, features)
-  TASKS/         # one task file per delegation (named <agent>-<slug>.md)
-  COMPLETIONS/   # one summary per completed task (named <agent>-<slug>.md)
-```
+## MULTI-REPO flow
+- One agent per repo. Each repo keeps its own AGENTS/ directory (TASKS, COMPLETIONS, CONTEXT).
+- Task files: `<repo>/AGENTS/TASKS/<agent>-<slug>.md`.
+- Agent works in its repo on a new branch, pushes branch, opens PR. Main reviews/merges.
 
-## Delegation flow (HEAD)
-1. Scope the task; gather global context (architecture, abnormal-but-intentional quirks, extra docs).
-2. Write context files into `AGENTS/CONTEXT/` if missing.
-3. Write the task into `AGENTS/TASKS/<agent>-<slug>.md` (self-contained, with goal, scope, constraints, acceptance criteria, and the completion file name).
-4. If the sub-agent is new: `create` with a relevant name + workingDirectory (empty = main cwd), then `send`.
-   If existing: just `send`.
-5. The invoking prompt tells the sub-agent to read context files only if this is a new agent or context changed; otherwise just read the task file and start.
-6. On completion, the main agent tells the sub-agent the exact completion file name (`AGENTS/COMPLETIONS/<agent>-<slug>.md`); the sub-agent MUST write its summary there.
+## MONOREPO flow (ask user approval first)
+1. Prep: ensure `abcd` has git origin and latest is pushed.
+2. Copy secrets to all replicas.
+3. For N writer agents: create `abcd-<agent>/` dirs, each `git clone` of the repo.
+   Each clone has its own `.git` (full isolation). Base `abcd/` loses `.git` (codebase gone; only coordinator space remains).
+4. Delegate: task files go in `abcd-<agent>/AGENTS/TASKS/<agent>-<slug>.md`.
+   Each agent works in its clone on a new branch (never master), pushes branch, opens PR.
+5. Review/merge: main agent reviews PRs + CI, merges passing to master/main.
+6. Sync: pull latest master into each clone after merges.
 
-## Sub-agent obligations
-- Read context files ONLY when the main agent explicitly instructs (new agent or context changed). Otherwise skip.
-- Work only in assigned working directory / write scope (enforced softly via task prompt for now).
-- On completion, write a summary to the designated `AGENTS/COMPLETIONS/*.md` file.
+## Agent obligations
+- Use abgit for all git ops (runs in agent's own clone cwd).
+- Never commit/push to master directly; branch → commit → push branch → PR.
+- Write summary (incl. PR URL/branch) to designated completion file.
+- Read context files only when main agent explicitly says so.
 
-## Prompt changes needed
-- Rewrite `STATIC_HEAD_SYSTEM_PROMPT` delegation rules to encode the above flow.
-- Add a sub-agent system-prompt section instructing completion-summary writing and conditional context reading (only when main agent says so).
-- Update tool descriptions (`send`/`create`) to mention task files and completion files.
-- Keep prompts compact (prefix-cache friendly).
+## Main agent obligations
+- Detect repo type; ask if ambiguous.
+- For monorepo, propose plan and wait for user approval before cloning.
+- Stay in base dir (coordinator space) for orchestration.
 
 ## Approval
-Reply "approve" to implement; otherwise request changes.
+Reply "approve" to implement prompt changes.

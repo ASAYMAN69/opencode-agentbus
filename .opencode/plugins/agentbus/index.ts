@@ -59,14 +59,24 @@ Use the 'agentbus' tool with one of these actions:
 DELEGATION RULES (file-based workflow):
 Workspace folders: AGENTS/CONTEXT/ (global context), AGENTS/TASKS/ (task files), AGENTS/COMPLETIONS/ (summaries).
 
+REPO TYPE (detect before delegating):
+- >1 .git or top-level looks like frontend/backend/admin → MULTI-REPO.
+- 1 .git with src/lib in base → MONOREPO.
+- If ambiguous, ask the user.
+
+MULTI-REPO: one agent per repo. Each repo has its own AGENTS/ dir. Task files: <repo>/AGENTS/TASKS/<agent>-<slug>.md.
+
+MONOREPO: ask user approval first. Then ensure origin + latest pushed, copy secrets, create <repo>-<agent>/ clones (each with own .git), base repo loses .git. Task files: <repo>-<agent>/AGENTS/TASKS/<agent>-<slug>.md.
+
 1. Before delegating, scope the task and gather global context into AGENTS/CONTEXT/ if missing.
-2. Write the task to AGENTS/TASKS/<agent>-<slug>.md (self-contained: goal, scope, constraints, acceptance criteria, and the exact completion file name AGENTS/COMPLETIONS/<agent>-<slug>.md).
+2. Write the task to the appropriate AGENTS/TASKS/<agent>-<slug>.md (self-contained: goal, scope, constraints, acceptance criteria, completion file name AGENTS/COMPLETIONS/<agent>-<slug>.md).
 3. Deploy:
    - New sub-agent: 'create' (relevant name + workingDirectory; empty = main cwd) then 'send'.
    - Existing sub-agent: just 'send'.
    - Never 'create' and stop if there is a task.
 4. In the 'send' message: refer to the task file path (absolute). Tell the sub-agent to read AGENTS/CONTEXT/* ONLY if it is a new agent or context changed; otherwise skip context and read only the task file. Include the completion file name so the sub-agent knows where to write its summary.
-5. Do not implement sub-agent tasks directly in the main session; delegate via 'agentbus'.`
+5. Branch/PR: sub-agent creates branch feat/<slug> or fix/<slug>, commits there (never master), pushes branch, opens PR, records PR URL/branch in completion summary. HEAD reviews PR + CI, then merges. HEAD owns integration.
+6. Do not implement sub-agent tasks directly in the main session; delegate via 'agentbus'.`
 
 async function loadSkillsIndex(skillNames: string[]): Promise<string> {
   const home = process.env.HOME || "/home/asayman"
@@ -229,8 +239,10 @@ You receive tasks in the format:
 1. Follow the task brief and work strictly within your scope.
 2. Read AGENTS/CONTEXT/* ONLY if the main agent explicitly says to (new agent or context changed).
 3. Complete all work and verification.
-4. Write a summary to the completion file path given by the main agent (AGENTS/COMPLETIONS/<agent>-<slug>.md).
-5. Finish with your clear summary.`
+4. Branch before editing: git checkout -b feat/<slug> or fix/<slug>. Never commit to master.
+5. Push your branch and open a PR: git push -u origin <branch>, then gh pr create --base master --head <branch>.
+6. Write a summary (including PR URL/branch) to the completion file path given by the main agent (AGENTS/COMPLETIONS/<agent>-<slug>.md).
+7. Finish with your clear summary.`
     }
 
     async function initSubAgentSession(
